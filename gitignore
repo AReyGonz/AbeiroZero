@@ -1,0 +1,32 @@
+# Environment variables / secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Datos descargados (no versionar, pueden ser pesados o privados)
+data/raw/
+data/processed/
+*.zip
+*.json
+!*.example.json
+
+# Salida de scripts
+output/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+*.tmp
