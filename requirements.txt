@@ -1,1 +1,11 @@
 requests
+rasterio 
+geopandas 
+numpy 
+matplotlib 
+shapely 
+pyproj 
+fiona
+gdaldem
+gdalwarp
+owslib
