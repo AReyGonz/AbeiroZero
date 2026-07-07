@@ -70,7 +70,13 @@ import geopandas as gpd
 import matplotlib.pyplot as plt
 import requests
 from requests.adapters import HTTPAdapter
-from shapely.geometry import LineString, box, shape
+
+from shapely.geometry import (
+    LineString,
+    Point,
+    box,
+    shape
+)
 from shapely.validation import make_valid
 from urllib3.util.retry import Retry
 
@@ -218,7 +224,24 @@ def construir_query_por_bbox(bbox, categorias):
     );
     out body geom;
     """
+def construir_query_nucleos(relation_id):
+    """
+    Obtiene núcleos de población OSM.
+    """
 
+    area_id = 3600000000 + relation_id
+
+    return f"""
+    [out:json][timeout:120];
+
+    area({area_id})->.searchArea;
+
+    (
+      node["place"~"^(city|town|village|hamlet|isolated_dwelling)$"](area.searchArea);
+    );
+
+    out body;
+    """
 
 def consultar_overpass(sesion, query):
     """
@@ -284,6 +307,37 @@ def parsear_respuesta_overpass(data, atributos):
 
     return registros
 
+def parsear_nucleos_osm(data):
+    """
+    Convierte los nodos OSM etiquetados como núcleos
+    de población en registros geográficos.
+    """
+
+    registros = []
+
+    for el in data.get("elements", []):
+
+        if el.get("type") != "node":
+            continue
+
+        tags = el.get("tags", {})
+
+        nombre = tags.get("name")
+
+        if not nombre:
+            continue
+
+        registros.append({
+            "osm_id": el["id"],
+            "Village_Name": nombre,
+            "place": tags.get("place"),
+            "geometry": Point(
+                el["lon"],
+                el["lat"]
+            ),
+        })
+
+    return registros
 
 def construir_geodataframe(registros):
     if not registros:
@@ -380,6 +434,59 @@ def exportar(gdf, boundary_gdf, carpeta_salida):
 
     return rutas
 
+def exportar_nucleos(
+    villages_gdf,
+    carpeta_salida
+):
+    """
+    Exporta los núcleos de población.
+    """
+
+    carpeta_salida = Path(carpeta_salida)
+
+    try:
+
+        ruta = (
+            carpeta_salida /
+            "larouco_villages.geojson"
+        )
+
+        villages_gdf.to_file(
+            ruta,
+            driver="GeoJSON"
+        )
+
+        logger.info(
+            f"Núcleos exportados: {ruta}"
+        )
+
+    except Exception as e:
+
+        logger.error(
+            f"Error exportando núcleos: {e}"
+        )
+
+    try:
+
+        ruta_gpkg = (
+            carpeta_salida /
+            "larouco_villages.gpkg"
+        )
+
+        villages_gdf.to_file(
+            ruta_gpkg,
+            driver="GPKG"
+        )
+
+        logger.info(
+            f"Núcleos exportados: {ruta_gpkg}"
+        )
+
+    except Exception as e:
+
+        logger.error(
+            f"Error exportando núcleos GPKG: {e}"
+        )
 
 # ------------------------------------------------------------------------------
 # PASO 8: VISUALIZACIÓN
@@ -474,6 +581,40 @@ def main():
         logger.info(f"Resolviendo municipio '{args.municipio}' en Nominatim...")
         relation_id, boundary_geom = obtener_relacion_municipio(sesion, args.municipio)
 
+        villages_gdf = None
+
+        if relation_id is not None:
+
+            logger.info(
+                "Descargando núcleos OSM..."
+            )
+
+            query_nucleos = construir_query_nucleos(
+                relation_id
+            )
+
+            data_nucleos = consultar_overpass(
+                sesion,
+                query_nucleos
+            )
+
+            registros_nucleos = parsear_nucleos_osm(
+                data_nucleos
+            )
+
+            if registros_nucleos:
+
+                villages_gdf = gpd.GeoDataFrame(
+                    registros_nucleos,
+                    geometry="geometry",
+                    crs="EPSG:4326"
+                )
+
+                logger.info(
+                    f"Núcleos encontrados: "
+                    f"{len(villages_gdf)}"
+                )
+
         if boundary_geom is None:
             logger.warning(f"Sin polígono de Nominatim; se usa bbox de respaldo: {BBOX_RESPALDO}")
             boundary_geom = box(*BBOX_RESPALDO)
@@ -494,9 +635,21 @@ def main():
         logger.info(f"Reproyectando a {args.epsg}...")
         gdf_utm = gdf.to_crs(args.epsg)
         boundary_utm = boundary_gdf.to_crs(args.epsg)
+
+        if villages_gdf is not None:
+
+            villages_gdf = villages_gdf.to_crs(
+                args.epsg)
+            
         gdf_utm = calcular_atributos_derivados(gdf_utm)
 
         rutas = exportar(gdf_utm, boundary_utm, args.salida)
+
+        if villages_gdf is not None:
+
+            exportar_nucleos(
+                villages_gdf,
+                args.salida)
 
         ruta_png = str(Path(args.salida) / "roads_larouco_visualizacion.png")
         visualizar(gdf_utm, boundary_utm, ruta_png)
