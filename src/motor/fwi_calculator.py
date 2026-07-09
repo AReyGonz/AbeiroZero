@@ -1,5 +1,5 @@
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from fwi import FWI
 
 # ==========================================
@@ -33,7 +33,6 @@ def obtener_memoria_forestal():
     
     if row:
         return {"ffmc": row[0], "dmc": row[1], "dc": row[2]}
-    # Valores estándar (Primavera húmeda) para iniciar el sistema si no hay datos previos.
     return {"ffmc": 85.0, "dmc": 6.0, "dc": 15.0}
 
 def guardar_nuevo_estado_forestal(fecha, fwi_calc):
@@ -58,33 +57,42 @@ def interpretar_riesgo(fwi_val):
 def calcular_fwi():
     inicializar_db_forestal()
     
-    # 1. Definir Ventana Temporal (Últimas 24h exactas)
-    ahora = datetime.now(timezone.utc)
-    hace_24h = ahora - timedelta(hours=24)
-    str_ahora = ahora.strftime("%Y-%m-%dT%H:%M:%S")
-    str_24h = hace_24h.strftime("%Y-%m-%dT%H:%M:%S")
-
-    # 2. Consultar Base de Datos
+    # 1. Consultar Base de Datos para obtener la última lectura real disponible
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     
-    # Lluvia ACUMULADA
-    c.execute("SELECT SUM(precipitacion) FROM meteo_10min WHERE timestamp >= ? AND timestamp <= ?", (str_24h, str_ahora))
-    lluvia_24h = c.fetchone()[0] or 0.0
-    
-    # Condiciones INSTANTÁNEAS (Temperatura, HR, Viento)
     c.execute("SELECT temperatura, humedad, viento_vel, timestamp FROM meteo_10min ORDER BY timestamp DESC LIMIT 1")
     ult_registro = c.fetchone()
-    conn.close()
     
     if not ult_registro:
-        print("⚠ Error: La base de datos está vacía. Ejecuta el script de ingesta (ingesta_meteo.py) primero.")
+        print("⚠ Error: La base de datos está vacía. Ejecuta el script de ingesta primero.")
+        conn.close()
         return
 
     temp, hr, viento, ts_medida = ult_registro
     
+    # Estandarizar lectura temporal sin "Z"
+    ts_medida_limpio = ts_medida.replace("Z", "")
+    
+    # 2. Definir Ventana Temporal basada en el timestamp real de la medición
+    try:
+        dt_objetivo = datetime.strptime(ts_medida_limpio, "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        # Alternativa por si el formato de la API viene recortado
+        dt_objetivo = datetime.strptime(ts_medida_limpio.split(".")[0], "%Y-%m-%dT%H:%M:%S")
+        
+    dt_hace_24h = dt_objetivo - timedelta(hours=24)
+    
+    str_ahora = dt_objetivo.strftime("%Y-%m-%dT%H:%M:%S")
+    str_24h = dt_hace_24h.strftime("%Y-%m-%dT%H:%M:%S")
+
+    # Lluvia ACUMULADA real en esa ventana temporal
+    c.execute("SELECT SUM(precipitacion) FROM meteo_10min WHERE timestamp >= ? AND timestamp <= ?", (str_24h, str_ahora))
+    lluvia_24h = c.fetchone()[0] or 0.0
+    conn.close()
+    
     # 3. Preparar variables para el FWI
-    mes_actual = ahora.month
+    mes_actual = dt_objetivo.month
     memoria = obtener_memoria_forestal()
 
     # 4. Cálculo Matemático (Librería FWI)
@@ -94,12 +102,12 @@ def calcular_fwi():
         mes_actual
     )
     
-    # 5. Persistencia (Guardar para mañana)
-    guardar_nuevo_estado_forestal(ahora.strftime("%Y-%m-%d"), fwi_calc)
+    # 5. Persistencia utilizando la fecha del registro procesado
+    guardar_nuevo_estado_forestal(dt_objetivo.strftime("%Y-%m-%d"), fwi_calc)
 
     # 6. Reporte Final
     print("\n" + "="*45)
-    print(f"🔥 REPORTE FWI LAROUCO ({ts_medida}) 🔥")
+    print(f"🔥 REPORTE FWI LAROUCO ({ts_medida_limpio}) 🔥")
     print("="*45)
     print(f"🌧️ Lluvia Acumulada (24h): {lluvia_24h:.1f} mm")
     print(f"🌡️ Temp: {temp}ºC | 💧 HR: {hr}% | 💨 Viento: {viento} km/h\n")
@@ -116,3 +124,4 @@ def calcular_fwi():
 
 if __name__ == "__main__":
     calcular_fwi()
+    

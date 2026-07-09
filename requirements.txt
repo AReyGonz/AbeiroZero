@@ -6,6 +6,5 @@ matplotlib
 shapely 
 pyproj 
 fiona
-gdaldem
-gdalwarp
+gdal
 owslib
