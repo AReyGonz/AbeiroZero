@@ -1,43 +1,24 @@
-# AbeiroZero
+# AbeiroZero 🌲🔥
 
-Arquitectura ETL y mapas para Abeiro.
+A production-grade wildfire prediction, monitoring, and decision-support platform tailored for the municipality of Larouco (Galicia, Spain). 
 
-## Estructura
+## Purpose
+AbeiroZero bridges the gap between raw geospatial data and actionable fire intelligence. By aggregating real-time weather, satellite imagery, and static fuel maps, the system calculates ignition risk, physical fire propagation paths, and human vulnerability indexes.
 
-```
-src/
-├── etl/        # scripts de extracción y transformación de datos
-└── config/     # configuración no sensible (endpoints, constantes)
-data/
-├── raw/        # datos descargados sin procesar (no versionado)
-└── processed/  # datos limpios/transformados (no versionado)
-output/         # resultados finales, JSONs de salida (no versionado)
-docs/           # documentación del proyecto
-```
+## Architecture
+- **Data Engine:** Prefect orchestrating Python ETLs.
+- **Geospatial Storage:** PostGIS (Vector) + GeoParquet/COGs (Raster).
+- **Core Standard:** EPSG:25829 (ETRS89 / UTM Zone 29N).
+- **API:** FastAPI powering the frontend and external integrations.
 
-## Configuración
-
-1. Copia `.env.example` a `.env`:
-   ```powershell
-   Copy-Item .env.example .env
-   ```
-2. Rellena `.env` con tus credenciales reales (Copernicus, etc.). Este archivo
-   nunca se sube al repositorio.
-
-## Instalación
-
-```powershell
-python -m pip install -r requirements.txt
-```
-
-## Scripts disponibles
-
-- `src/etl/etl_MeteoGalicia.py` — descarga la última lectura (10 min) de la
-  estación de MeteoGalicia en Larouco (id 19030) y la guarda en
-  `output/meteo_larouco_ultimo.json`.
-
-## Fuentes de datos
-
-- **MeteoGalicia**: API REST pública, sin API key.
-- **Copernicus Data Space Ecosystem (CDSE)**: requiere cuenta gratuita,
-  usada para datos COP-DEM.
+## Data Sources
+* **MeteoGalicia:** 10-minute weather telemetry.
+* **Sentinel-2 (AWS):** 5-day revisit vegetation vigor (NDVI) and moisture (NDMI).
+* **Copernicus DEM (GLO-30):** Terrain analysis (Slope, Aspect).
+* **MFE25:** Spanish Forest Map translated to Canadian FBP fuel models.
+* **IGE:** Population and age groups.
+* **OSM:** Roads and ways. Villages.
+---
+* **EFFIS & COP-EMS:** Historical data of fires.
+---
+* **NASA FIRMS & EUMETSAT MTG:** Discover & Monitor active fires. 
