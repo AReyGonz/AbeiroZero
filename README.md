@@ -13,8 +13,8 @@ AbeiroZero bridges the gap between raw geospatial data and actionable fire intel
 
 ## Data Sources
 * **MeteoGalicia:** 10-minute weather telemetry.
-* **Sentinel-2 (AWS):** 5-day revisit vegetation vigor (NDVI) and moisture (NDMI).
-* **Copernicus DEM (GLO-30):** Terrain analysis (Slope, Aspect).
+* **Sentinel-2 (Copernicus Stac API):** 5-day revisit vegetation vigor (NDVI) and moisture (NDMI).
+* **Copernicus DEM (GLO-30) - (AWS):** Terrain analysis (Slope, Aspect).
 * **MFE25:** Spanish Forest Map translated to Canadian FBP fuel models.
 * **IGE:** Population and age groups.
 * **OSM:** Roads and ways. Villages.
