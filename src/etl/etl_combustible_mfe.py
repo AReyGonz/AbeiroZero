@@ -2,297 +2,167 @@
 # -*- coding: utf-8 -*-
 
 """
-ETL MFE Galicia -> Modelos de combustible para Larouco
+AbeiroZero
+MFE25 Galicia -> Modelos de combustible de Larouco
 
-Autor: Ejemplo
-Python: 3.11+
+Fuente:
+https://www.miteco.gob.es/es/cartografia-y-sig/ide/descargas/biodiversidad/mfe_galicia.html
 
-Dependencias:
+Workflow
 
-pip install geopandas pandas requests shapely pyproj matplotlib \
-            fiona rasterio tqdm
+MFE25 Galicia descargado localmente
+        ↓
+Lectura shapefile
+        ↓
+AOI Larouco
+(src.aoi.boundary.get_aoi)
+        ↓
+Recorte espacial
+        ↓
+Inspección atributos
+        ↓
+Construcción modelo combustible
+        ↓
+Exportaciones
 
-Objetivos:
-- Descargar MFE Galicia
-- Obtener límite de Larouco
-- Recortar información forestal
-- Construir una capa de combustibles
-- Generar estadísticas
-- Exportar resultados
+Outputs:
+
+output/
+├── larouco_combustibles.gpkg
+├── larouco_combustibles.geojson
+├── estadisticas_combustible.csv
+├── mapa_combustibles.png
+├── mfe25_schema.csv
+└── proceso.log
 """
 
-import os
-import sys
-import zipfile
 import logging
+import sys
 from pathlib import Path
 
-import requests
-import pandas as pd
 import geopandas as gpd
+import pandas as pd
 import matplotlib.pyplot as plt
 
-from tqdm import tqdm
-from shapely.geometry import shape, box
+from src.aoi.boundary import get_aoi
 
-# ------------------------------------------------------------------------------
-# CONFIGURACIÓN
-# ------------------------------------------------------------------------------
+
+# ==========================================================
+# CONFIG
+# ==========================================================
 
 BASE_DIR = Path.cwd()
 
-DATA_DIR = BASE_DIR / "data"
-OUTPUT_DIR = BASE_DIR / "output"
-
-DATA_DIR.mkdir(exist_ok=True)
-OUTPUT_DIR.mkdir(exist_ok=True)
-
-LOG_FILE = OUTPUT_DIR / "proceso.log"
-
-MFE_URL = (
-    "https://www.mapama.gob.es/app/descargas/"
-    "descargafichero.aspx?f=mfe_Galicia.rar"
+MFE_FOLDER = (
+    BASE_DIR
+    / "data"
+    / "reference"
+    / "mfe25_galicia"
 )
 
-MFE_FILE = DATA_DIR / "mfe_galicia.rar"
+OUTPUT_DIR = (
+    BASE_DIR
+    / "output"
+)
+
+OUTPUT_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+LOG_FILE = (
+    OUTPUT_DIR
+    / "proceso.log"
+)
 
 TARGET_CRS = "EPSG:25829"
 
-# Bounding box de respaldo aproximado
-FALLBACK_BBOX = (
-    -7.24,
-    42.31,
-    -7.09,
-    42.40
-)
 
-# ------------------------------------------------------------------------------
+# ==========================================================
 # LOGGING
-# ------------------------------------------------------------------------------
+# ==========================================================
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
+    format=(
+        "%(asctime)s - "
+        "%(levelname)s - "
+        "%(message)s"
+    ),
     handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf8"),
-        logging.StreamHandler(sys.stdout)
+        logging.FileHandler(
+            LOG_FILE,
+            encoding="utf8"
+        ),
+        logging.StreamHandler(
+            sys.stdout
+        )
     ]
 )
 
-# ------------------------------------------------------------------------------
-# DESCARGA
-# ------------------------------------------------------------------------------
 
+# ==========================================================
+# CARGA MFE
+# ==========================================================
 
-def download_mfe():
-    """
-    Descarga el MFE Galicia si no existe.
-    """
-
-    if MFE_FILE.exists():
-        logging.info("El archivo MFE ya existe.")
-        return
-
-    logging.info("Descargando MFE Galicia...")
-
-    response = requests.get(
-        MFE_URL,
-        stream=True,
-        timeout=300
-    )
-
-    response.raise_for_status()
-
-    total_size = int(
-        response.headers.get(
-            "content-length",
-            0
-        )
-    )
-
-    with open(MFE_FILE, "wb") as f:
-
-        with tqdm(
-            total=total_size,
-            unit="B",
-            unit_scale=True
-        ) as pbar:
-
-            for chunk in response.iter_content(
-                chunk_size=8192
-            ):
-
-                if chunk:
-                    f.write(chunk)
-                    pbar.update(len(chunk))
-
-    logging.info("Descarga finalizada.")
-
-
-# ------------------------------------------------------------------------------
-# EXTRACCIÓN
-# ------------------------------------------------------------------------------
-
-
-def extract_data():
-
-    extract_folder = DATA_DIR / "mfe_galicia"
-
-    if extract_folder.exists():
-        return extract_folder
-
-    logging.info(
-        "Extraer manualmente si el fichero es .rar "
-        "y no dispone de soporte unrar."
-    )
-
-    return extract_folder
-
-
-# ------------------------------------------------------------------------------
-# LÍMITE MUNICIPAL
-# ------------------------------------------------------------------------------
-
-
-def get_municipality_boundary():
-
-    overpass_url = (
-        "https://overpass-api.de/api/interpreter"
-    )
-
-    query = """
-    [out:json][timeout:60];
-    relation
-      ["boundary"="administrative"]
-      ["admin_level"="8"]
-      ["name"="Larouco"];
-    out geom;
-    """
-
-    try:
-
-        r = requests.get(
-            overpass_url,
-            params={"data": query},
-            timeout=120
-        )
-
-        r.raise_for_status()
-
-        data = r.json()
-
-        if len(data["elements"]) == 0:
-            raise ValueError()
-
-        from shapely.geometry import Polygon
-        from shapely.ops import unary_union
-
-        polygons = []
-
-        for member in data["elements"][0]["members"]:
-
-            if "geometry" not in member:
-                continue
-
-            coords = [
-                (p["lon"], p["lat"])
-                for p in member["geometry"]
-            ]
-
-            if len(coords) >= 4:
-                polygons.append(
-                    Polygon(coords)
-                )
-
-        geom = unary_union(polygons)
-
-        gdf = gpd.GeoDataFrame(
-            {"name": ["Larouco"]},
-            geometry=[geom],
-            crs="EPSG:4326"
-        )
-
-        logging.info(
-            "Límite obtenido desde OSM."
-        )
-
-    except Exception:
-
-        logging.warning(
-            "No se pudo obtener Larouco desde OSM."
-        )
-
-        gdf = gpd.GeoDataFrame(
-            geometry=[
-                box(*FALLBACK_BBOX)
-            ],
-            crs="EPSG:4326"
-        )
-
-    gdf = gdf.to_crs(TARGET_CRS)
-
-    output = OUTPUT_DIR / "larouco_boundary.gpkg"
-
-    gdf.to_file(
-        output,
-        driver="GPKG"
-    )
-
-    return gdf
-
-
-# ------------------------------------------------------------------------------
-# CARGA DEL MFE
-# ------------------------------------------------------------------------------
-
-
-def load_mfe_layer(folder):
+def load_mfe_layer():
 
     shp_files = list(
-        folder.rglob("*.shp")
+        MFE_FOLDER.rglob("*.shp")
     )
 
     if not shp_files:
 
         raise FileNotFoundError(
-            "No se encontraron Shapefiles"
+            f"No se encontraron shapefiles "
+            f"en {MFE_FOLDER}"
         )
 
     logging.info(
-        f"Encontradas {len(shp_files)} capas."
+        f"Shapefiles encontrados: "
+        f"{len(shp_files)}"
     )
 
     largest = max(
         shp_files,
-        key=lambda x: x.stat().st_size
+        key=lambda p: p.stat().st_size
     )
 
     logging.info(
-        f"Usando capa: {largest.name}"
+        f"Capa seleccionada: "
+        f"{largest.name}"
     )
 
-    return gpd.read_file(largest)
+    gdf = gpd.read_file(
+        largest
+    )
+
+    logging.info(
+        f"Teselas cargadas: "
+        f"{len(gdf):,}"
+    )
+
+    return gdf
 
 
-# ------------------------------------------------------------------------------
+# ==========================================================
 # LIMPIEZA
-# ------------------------------------------------------------------------------
-
+# ==========================================================
 
 def clean_data(gdf):
 
     logging.info(
-        "Ejecutando limpieza..."
+        "Limpiando geometrías..."
     )
 
     gdf = gdf.copy()
 
     gdf = gdf[
-        ~gdf.geometry.is_empty
+        gdf.geometry.notnull()
     ]
 
     gdf = gdf[
-        gdf.geometry.notnull()
+        ~gdf.geometry.is_empty
     ]
 
     gdf["geometry"] = (
@@ -304,78 +174,111 @@ def clean_data(gdf):
     return gdf
 
 
-# ------------------------------------------------------------------------------
-# RECORTE
-# ------------------------------------------------------------------------------
+# ==========================================================
+# ESQUEMA
+# ==========================================================
+
+def export_schema(gdf):
+
+    schema = pd.DataFrame({
+        "column":
+            gdf.columns,
+        "dtype":
+            gdf.dtypes.astype(str)
+    })
+
+    schema.to_csv(
+        OUTPUT_DIR
+        / "mfe25_schema.csv",
+        index=False
+    )
+
+    logging.info(
+        "Schema exportado."
+    )
 
 
-def clip_to_larouco(
+# ==========================================================
+# CLIP AOI
+# ==========================================================
+
+def clip_to_aoi(
     mfe,
-    boundary
+    aoi
 ):
 
     logging.info(
-        "Recortando municipio..."
+        "Recortando a Larouco..."
     )
 
-    if mfe.crs != TARGET_CRS:
+    if mfe.crs != aoi.crs:
+
         mfe = mfe.to_crs(
-            TARGET_CRS
+            aoi.crs
         )
 
-    return gpd.overlay(
+    clipped = gpd.overlay(
         mfe,
-        boundary,
+        aoi,
         how="intersection"
     )
 
+    logging.info(
+        f"Teselas resultantes: "
+        f"{len(clipped):,}"
+    )
 
-# ------------------------------------------------------------------------------
-# COMBUSTIBLES
-# ------------------------------------------------------------------------------
+    return clipped
 
+
+# ==========================================================
+# MODELO COMBUSTIBLE
+# ==========================================================
 
 def build_fuel_model(gdf):
 
-    """
-    Ajustar según campos reales.
-    """
+    gdf = gdf.copy()
+
+    export_schema(gdf)
 
     logging.info(
-        "Construyendo modelo de combustible..."
+        "Columnas detectadas:"
     )
 
-    print("\nCampos disponibles:\n")
+    for col in gdf.columns:
+        logging.info(f"  {col}")
 
-    for c in gdf.columns:
-        print(c)
+    #
+    # TEMPORAL
+    #
+    # Primera ejecución:
+    # revisar output/mfe25_schema.csv
+    # y adaptar con los nombres reales
+    #
 
     gdf["fuel_type"] = (
-        "SIN_CLASIFICAR"
+        "PENDIENTE_MAPEO"
     )
-
-    # Ejemplo simplificado
-    # Adaptar tras inspeccionar
-    # estructura real del MFE.
 
     return gdf
 
 
-# ------------------------------------------------------------------------------
+# ==========================================================
 # ESTADÍSTICAS
-# ------------------------------------------------------------------------------
-
+# ==========================================================
 
 def calculate_statistics(gdf):
 
     gdf = gdf.copy()
 
     gdf["area_ha"] = (
-        gdf.area / 10000
+        gdf.geometry.area
+        / 10000
     )
 
     stats = (
-        gdf.groupby("fuel_type")
+        gdf
+        .groupby("fuel_type")
         .agg(
             superficie_ha=(
                 "area_ha",
@@ -389,9 +292,10 @@ def calculate_statistics(gdf):
         .reset_index()
     )
 
-    total = stats[
-        "superficie_ha"
-    ].sum()
+    total = (
+        stats["superficie_ha"]
+        .sum()
+    )
 
     stats["porcentaje"] = (
         stats["superficie_ha"]
@@ -399,59 +303,64 @@ def calculate_statistics(gdf):
         * 100
     )
 
-    csv_path = (
-        OUTPUT_DIR
-        / "estadisticas_combustible.csv"
-    )
-
     stats.to_csv(
-        csv_path,
+        OUTPUT_DIR
+        / "estadisticas_combustible.csv",
         index=False
     )
 
     return stats
 
 
-# ------------------------------------------------------------------------------
-# EXPORTACIÓN
-# ------------------------------------------------------------------------------
-
+# ==========================================================
+# EXPORT
+# ==========================================================
 
 def export_results(gdf):
 
+    gpkg = (
+        OUTPUT_DIR
+        / "larouco_combustibles.gpkg"
+    )
+
+    geojson = (
+        OUTPUT_DIR
+        / "larouco_combustibles.geojson"
+    )
+
     gdf.to_file(
-        OUTPUT_DIR /
-        "larouco_combustibles.gpkg",
+        gpkg,
         driver="GPKG"
     )
 
     gdf.to_file(
-        OUTPUT_DIR /
-        "larouco_combustibles.geojson",
+        geojson,
         driver="GeoJSON"
     )
 
-    gdf.to_file(
-        OUTPUT_DIR /
-        "larouco_combustibles.shp"
+    logging.info(
+        f"Exportado: {gpkg}"
+    )
+
+    logging.info(
+        f"Exportado: {geojson}"
     )
 
 
-# ------------------------------------------------------------------------------
+# ==========================================================
 # MAPA
-# ------------------------------------------------------------------------------
-
+# ==========================================================
 
 def generate_map(
     fuel_gdf,
-    boundary_gdf
+    aoi
 ):
 
     fig, ax = plt.subplots(
         figsize=(10, 10)
     )
 
-    boundary_gdf.boundary.plot(
+    aoi.boundary.plot(
         ax=ax,
         color="black",
         linewidth=2
@@ -464,44 +373,51 @@ def generate_map(
     )
 
     ax.set_title(
-        "Modelos de combustible - Larouco"
+        "Combustibles forestales - Larouco"
     )
 
-    ax.set_axis_off()
+    ax.axis("off")
 
     plt.tight_layout()
 
     plt.savefig(
-        OUTPUT_DIR /
-        "mapa_combustibles.png",
+        OUTPUT_DIR
+        / "mapa_combustibles.png",
         dpi=300
     )
 
     plt.close()
 
 
-# ------------------------------------------------------------------------------
+# ==========================================================
 # MAIN
-# ------------------------------------------------------------------------------
-
+# ==========================================================
 
 def main():
 
-    download_mfe()
-
-    folder = extract_data()
-
-    boundary = (
-        get_municipality_boundary()
+    logging.info(
+        "=" * 60
     )
 
-    mfe = load_mfe_layer(folder)
+    logging.info(
+        "AbeiroZero - MFE25 Larouco"
+    )
 
-    mfe = clean_data(mfe)
+    logging.info(
+        "=" * 60
+    )
 
-    larouco = clip_to_larouco(
+    aoi = get_aoi()
+
+    mfe = load_mfe_layer()
+
+    mfe = clean_data(
+        mfe
+    )
+
+    larouco = clip_to_aoi(
         mfe,
-        boundary
+        aoi
     )
 
     fuel = build_fuel_model(
@@ -518,7 +434,7 @@ def main():
 
     generate_map(
         fuel,
-        boundary
+        aoi
     )
 
     logging.info(

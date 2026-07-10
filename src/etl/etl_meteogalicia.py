@@ -1,94 +1,148 @@
-import sqlite3
+import os
 import requests
+import pandas as pd
 from datetime import datetime
 
-# ==========================================
+# ==================================================
 # CONFIGURACIÓN
-# ==========================================
-DB_FILE = "meteogalicia_larouco.sqlite"
-ID_ESTACION = 19030 # Larouco
-URL_LIVE = "https://servizos.meteogalicia.gal/mgrss/observacion/ultimos10minEstacionsMeteo.action"
+# ==================================================
 
-def inicializar_db():
-    """Asegura que las tablas existan antes de insertar datos."""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS meteo_10min (
-            timestamp TEXT PRIMARY KEY,
-            temperatura REAL,
-            humedad REAL,
-            viento_vel REAL,
-            precipitacion REAL
+ID_ESTACION = 19030  # Larouco
+
+URL_LIVE = (
+    "https://servizos.meteogalicia.gal/mgrss/observacion/"
+    "ultimos10minEstacionsMeteo.action"
+)
+
+CSV_FILE = "../data/sample/larouco_10min.csv"
+
+# ==================================================
+# UTILIDADES
+# ==================================================
+
+def to_float(valor):
+    """Conversión robusta a float."""
+    try:
+        return float(valor)
+    except (TypeError, ValueError):
+        return None
+
+
+def extraer_variables(lista_medidas):
+    """
+    Extrae únicamente las variables necesarias.
+    """
+
+    datos = {
+        "temp_1_5m": None,
+        "hr_1_5m": None,
+        "vv_racha_10m": None,
+        "pp_sum": None
+    }
+
+    for medida in lista_medidas:
+
+        codigo = medida.get("codigoParametro", "")
+        valor = to_float(medida.get("valor"))
+
+        if codigo == "TA_AVG_1.5m":
+            datos["temp_1_5m"] = valor
+
+        elif codigo == "HR_AVG_1.5m":
+            datos["hr_1_5m"] = valor
+
+        elif codigo == "VV_RACHA_10m":
+            datos["vv_racha_10m"] = valor
+
+        elif codigo == "PP_SUM":
+            datos["pp_sum"] = valor
+
+    return datos
+
+
+def guardar_csv(registro):
+    """
+    Guarda en CSV evitando duplicados por timestamp.
+    """
+
+    os.makedirs(os.path.dirname(CSV_FILE), exist_ok=True)
+
+    if os.path.exists(CSV_FILE):
+
+        df = pd.read_csv(CSV_FILE)
+
+        if registro["timestamp"] in df["timestamp"].astype(str).values:
+            print("Registro ya existente.")
+            return
+
+        df = pd.concat(
+            [df, pd.DataFrame([registro])],
+            ignore_index=True
         )
-    ''')
-    conn.commit()
-    conn.close()
 
-def guardar_lectura_db(timestamp, temp, hr, vel, precip):
-    """Inserta la métrica en SQLite."""
-    # Limpieza básica para estandarizar cadenas de texto de tiempo en SQLite
-    timestamp_limpio = timestamp.replace("Z", "")
-    
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
+    else:
+        df = pd.DataFrame([registro])
+
+    df.sort_values("timestamp", inplace=True)
+
+    df.to_csv(CSV_FILE, index=False)
+
+    print(f"CSV actualizado: {CSV_FILE}")
+
+
+# ==================================================
+# INGESTA
+# ==================================================
+
+def main():
+
     try:
-        c.execute('''
-            INSERT INTO meteo_10min (timestamp, temperatura, humedad, viento_vel, precipitacion)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(timestamp) DO UPDATE SET
-                temperatura=excluded.temperatura,
-                humedad=excluded.humedad,
-                viento_vel=excluded.viento_vel,
-                precipitacion=excluded.precipitacion
-        ''', (timestamp_limpio, temp, hr, vel, precip))
-        conn.commit()
-    finally:
-        conn.close()
 
-def extraer_variables(medidas):
-    """Limpia y extrae las variables del array de MeteoGalicia."""
-    data = {"temp": 0.0, "hr": 0.0, "vel": 0.0, "precip": 0.0}
-    for m in medidas:
-        cod = m.get("codigoParametro", "")
-        val = m.get("valor", -9999)
-        val_seguro = float(val) if val is not None and float(val) >= 0 else 0.0
-        
-        # Corrección: Mantener lógica de asignación limpia evitando caídas por valores nulos
-        if cod.startswith("TA_AVG"): data["temp"] = float(val) if val is not None else 0.0
-        elif cod.startswith("HR_AVG"): data["hr"] = val_seguro
-        elif cod.startswith("VV_AVG"): data["vel"] = val_seguro
-        elif cod.startswith("PP_SUM"): data["precip"] = val_seguro
-    return data
+        r = requests.get(
+            URL_LIVE,
+            params={"idEst": ID_ESTACION},
+            timeout=20
+        )
 
-def main_ingesta():
-    inicializar_db()
-    try:
-        r = requests.get(URL_LIVE, params={"idEst": ID_ESTACION}, timeout=15)
         r.raise_for_status()
+
         data = r.json()
-        
-        estacion = next((e for e in data.get("listEstacions", [data]) if str(e.get("idEstacion")) == str(ID_ESTACION)), None)
-            
-        if estacion and "listaMedidas" in estacion:
-            timestamp = estacion["instanteLecturaUTC"]
-            vars_meteo = extraer_variables(estacion["listaMedidas"])
-            guardar_lectura_db(timestamp, vars_meteo["temp"], vars_meteo["hr"], vars_meteo["vel"], vars_meteo["precip"])
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Ingesta OK -> {timestamp}")
-            
-            # Handoff Automático Activo:
-            # Si quieres que el FWI corra inmediatamente después de la ingesta cada 10 min:
-            try:
-                from fwi_calculator import calcular_fwi
-                print("Iniciando cálculo FWI encadenado...")
-                calcular_fwi()
-            except ImportError:
-                print("Nota: fwi_calculator.py no acoplado directamente.")
-        else:
-            print("⚠ Estructura de la API inesperada o estación no encontrada.")
-            
-    except requests.exceptions.RequestException as e:
-        print(f"❌ Error de red en ingesta: {e}")
+
+        estacion = next(
+            (
+                e
+                for e in data.get("listEstacions", [data])
+                if str(e.get("idEstacion")) == str(ID_ESTACION)
+            ),
+            None,
+        )
+
+        if estacion is None:
+            print("Estación no encontrada.")
+            return
+
+        medidas = estacion.get("listaMedidas", [])
+
+        variables = extraer_variables(medidas)
+
+        registro = {
+            "timestamp": estacion["instanteLecturaUTC"],
+            **variables,
+        }
+
+        guardar_csv(registro)
+
+        print(
+            f"[{datetime.now():%Y-%m-%d %H:%M:%S}] "
+            f"Ingesta correcta"
+        )
+
+    except requests.exceptions.RequestException as exc:
+        print(f"Error de red: {exc}")
+
+    except Exception as exc:
+        print(f"Error inesperado: {exc}")
+
 
 if __name__ == "__main__":
-    main_ingesta()
+    main()

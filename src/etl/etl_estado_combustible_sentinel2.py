@@ -2,56 +2,53 @@
 # -*- coding: utf-8 -*-
 
 """
-Evaluación del estado del combustible vegetal en Larouco
-usando Sentinel-2 L2A y STAC API de Copernicus.
+AbeiroZero
+Estado del combustible vegetal (Sentinel-2)
 
 Productos:
+
 - NDVI
 - NDMI
-- NBR
 - Fuel Condition Index (FCI)
 
-Autor: Ejemplo
+AOI:
+- src.aoi.boundary.get_aoi()
+
+Fuentes:
+- Copernicus STAC API
+- Sentinel-2 L2A
 """
 
 import logging
-import os
 from pathlib import Path
 from datetime import datetime, timedelta
 
-import geopandas as gpd
 import numpy as np
 import pandas as pd
 import rasterio
 import requests
+import matplotlib.pyplot as plt
 
 from pystac_client import Client
-from rasterio.mask import mask
 from rasterio.io import MemoryFile
-from shapely.geometry import box, Polygon
-import matplotlib.pyplot as plt
+from rasterio.mask import mask
+
+from src.aoi.boundary import get_aoi
 
 
 # ==========================================================
-# CONFIGURACIÓN
+# CONFIG
 # ==========================================================
 
 MAX_CLOUD_COVER = 20
 DAYS_BACK = 30
 
-STAC_URL = "https://catalogue.dataspace.copernicus.eu/stac"
+STAC_URL = (
+    "https://catalogue.dataspace.copernicus.eu/stac"
+)
 
 OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
-
-TARGET_CRS = "EPSG:25829"
-
-FALLBACK_BBOX = (
-    -7.24,
-    42.31,
-    -7.09,
-    42.40
-)
 
 
 # ==========================================================
@@ -60,7 +57,11 @@ FALLBACK_BBOX = (
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
+    format=(
+        "%(asctime)s - "
+        "%(levelname)s - "
+        "%(message)s"
+    ),
     handlers=[
         logging.FileHandler(
             OUTPUT_DIR / "proceso.log",
@@ -72,116 +73,23 @@ logging.basicConfig(
 
 
 # ==========================================================
-# LÍMITE MUNICIPAL
+# STAC SEARCH
 # ==========================================================
 
-def get_boundary():
+def search_sentinel_image(aoi):
 
-    logging.info(
-        "Obteniendo límite municipal..."
-    )
-
-    query = """
-    [out:json][timeout:60];
-    relation
-      ["boundary"="administrative"]
-      ["admin_level"="8"]
-      ["name"="Larouco"];
-    out geom;
-    """
-
-    try:
-
-        url = (
-            "https://overpass-api.de/api/interpreter"
-        )
-
-        response = requests.get(
-            url,
-            params={"data": query},
-            timeout=120
-        )
-
-        response.raise_for_status()
-
-        data = response.json()
-
-        polys = []
-
-        for member in (
-            data["elements"][0]["members"]
-        ):
-
-            if "geometry" not in member:
-                continue
-
-            coords = [
-                (p["lon"], p["lat"])
-                for p in member["geometry"]
-            ]
-
-            if len(coords) > 3:
-                polys.append(
-                    Polygon(coords)
-                )
-
-        geom = gpd.GeoSeries(
-            polys,
-            crs="EPSG:4326"
-        ).union_all()
-
-        gdf = gpd.GeoDataFrame(
-            {"municipio": ["Larouco"]},
-            geometry=[geom],
-            crs="EPSG:4326"
-        )
-
-        logging.info(
-            "Límite obtenido desde OSM."
-        )
-
-    except Exception:
-
-        logging.warning(
-            "Usando bounding box de respaldo."
-        )
-
-        gdf = gpd.GeoDataFrame(
-            geometry=[
-                box(*FALLBACK_BBOX)
-            ],
-            crs="EPSG:4326"
-        )
-
-    gdf.to_file(
-        OUTPUT_DIR /
-        "larouco_boundary.gpkg",
-        driver="GPKG"
-    )
-
-    return gdf
-
-
-# ==========================================================
-# BÚSQUEDA SENTINEL-2
-# ==========================================================
-
-def search_sentinel_image(boundary):
-
-    logging.info(
-        "Buscando Sentinel-2..."
-    )
-
-    bbox = boundary.total_bounds
+    bbox = aoi.to_crs(
+        "EPSG:4326"
+    ).total_bounds
 
     start_date = (
         datetime.utcnow()
         - timedelta(days=DAYS_BACK)
     ).strftime("%Y-%m-%d")
 
-    end_date = datetime.utcnow().strftime(
-        "%Y-%m-%d"
-    )
+    end_date = (
+        datetime.utcnow()
+    ).strftime("%Y-%m-%d")
 
     client = Client.open(STAC_URL)
 
@@ -200,14 +108,14 @@ def search_sentinel_image(boundary):
 
     if not items:
         raise RuntimeError(
-            "No se encontraron imágenes."
+            "No hay imágenes Sentinel-2 válidas."
         )
 
-    items = sorted(
-        items,
+    items.sort(
         key=lambda x:
         x.properties.get(
-            "eo:cloud_cover", 100
+            "eo:cloud_cover",
+            100
         )
     )
 
@@ -222,23 +130,19 @@ def search_sentinel_image(boundary):
 
 
 # ==========================================================
-# DESCARGA DE BANDAS
+# DOWNLOAD
 # ==========================================================
 
 def download_band(url):
 
-    logging.info(
-        f"Descargando {url}"
-    )
-
-    response = requests.get(
+    r = requests.get(
         url,
         timeout=300
     )
 
-    response.raise_for_status()
+    r.raise_for_status()
 
-    return response.content
+    return r.content
 
 
 def open_band(asset_url):
@@ -251,48 +155,73 @@ def open_band(asset_url):
 
 
 # ==========================================================
-# MÁSCARA NUBES
+# AOI CROP
+# ==========================================================
+
+def crop_to_aoi(
+    dataset,
+    aoi
+):
+
+    geom = (
+        aoi
+        .to_crs(dataset.crs)
+        .geometry.iloc[0]
+    )
+
+    array, transform = mask(
+        dataset,
+        [geom.__geo_interface__],
+        crop=True
+    )
+
+    profile = dataset.profile.copy()
+
+    profile.update(
+        height=array.shape[1],
+        width=array.shape[2],
+        transform=transform
+    )
+
+    return array[0], profile
+
+
+# ==========================================================
+# CLOUDS
 # ==========================================================
 
 def build_cloud_mask(scl):
 
-    mask_cloud = np.isin(
+    return np.isin(
         scl,
         [
-            3,   # sombras
-            8,   # nube media
-            9,   # nube alta
-            10,  # cirrus
-            11   # nieve
+            3,
+            8,
+            9,
+            10,
+            11,
         ]
     )
 
-    return mask_cloud
-
 
 # ==========================================================
-# ÍNDICES
+# INDICES
 # ==========================================================
 
 def safe_index(a, b):
 
-    result = np.divide(
+    return np.divide(
         a - b,
         a + b,
         out=np.zeros_like(a),
         where=(a + b) != 0
-    )
-
-    return result.astype(
-        np.float32
-    )
+    ).astype(np.float32)
 
 
 def calculate_ndvi(
     nir,
     red
 ):
-
     return safe_index(
         nir,
         red
@@ -303,21 +232,9 @@ def calculate_ndmi(
     nir,
     swir
 ):
-
     return safe_index(
         nir,
         swir
-    )
-
-
-def calculate_nbr(
-    nir,
-    swir2
-):
-
-    return safe_index(
-        nir,
-        swir2
     )
 
 
@@ -327,30 +244,26 @@ def calculate_nbr(
 
 def calculate_fci(
     ndvi,
-    ndmi,
-    nbr
+    ndmi
 ):
 
-    """
-    FCI experimental.
-
-    Valores altos =
-    vegetación densa + seca.
-    """
-
     fci = (
-        (ndvi + 1) / 2
+        ((ndvi + 1) / 2)
         +
-        (1 - ((ndmi + 1) / 2))
-        +
-        (1 - ((nbr + 1) / 2))
-    ) / 3
+        (
+            1
+            -
+            ((ndmi + 1) / 2)
+        )
+    ) / 2
 
-    return fci
+    return fci.astype(
+        np.float32
+    )
 
 
 # ==========================================================
-# EXPORTACIÓN RASTER
+# EXPORT
 # ==========================================================
 
 def save_raster(
@@ -360,8 +273,8 @@ def save_raster(
 ):
 
     profile.update(
-        dtype="float32",
         count=1,
+        dtype="float32",
         compress="lzw"
     )
 
@@ -379,56 +292,8 @@ def save_raster(
         )
 
 
-# ==========================================================
-# ESTADÍSTICAS
-# ==========================================================
-
-def generate_statistics(
-    ndvi,
-    ndmi,
-    fci
-):
-
-    stats = {
-        "ndvi_mean":
-            float(
-                np.nanmean(ndvi)
-            ),
-        "ndvi_min":
-            float(
-                np.nanmin(ndvi)
-            ),
-        "ndvi_max":
-            float(
-                np.nanmax(ndvi)
-            ),
-        "ndmi_mean":
-            float(
-                np.nanmean(ndmi)
-            ),
-        "fci_mean":
-            float(
-                np.nanmean(fci)
-            )
-    }
-
-    df = pd.DataFrame(
-        [stats]
-    )
-
-    df.to_csv(
-        OUTPUT_DIR /
-        "estadisticas.csv",
-        index=False
-    )
-
-
-# ==========================================================
-# MAPAS
-# ==========================================================
-
 def save_map(
-    data,
+    array,
     title,
     cmap,
     filename
@@ -439,7 +304,7 @@ def save_map(
     )
 
     plt.imshow(
-        data,
+        array,
         cmap=cmap
     )
 
@@ -452,11 +317,55 @@ def save_map(
     plt.tight_layout()
 
     plt.savefig(
-        OUTPUT_DIR / filename,
+        OUTPUT_DIR /
+        filename,
         dpi=300
     )
 
     plt.close()
+
+
+def generate_statistics(
+    ndvi,
+    ndmi,
+    fci
+):
+
+    stats = {
+
+        "ndvi_mean":
+            float(
+                np.nanmean(ndvi)
+            ),
+
+        "ndmi_mean":
+            float(
+                np.nanmean(ndmi)
+            ),
+
+        "fci_mean":
+            float(
+                np.nanmean(fci)
+            ),
+
+        "pct_ndmi_bajo":
+
+            float(
+
+                np.nanmean(
+                    ndmi < 0.20
+                ) * 100
+
+            )
+    }
+
+    pd.DataFrame(
+        [stats]
+    ).to_csv(
+        OUTPUT_DIR /
+        "estadisticas.csv",
+        index=False
+    )
 
 
 # ==========================================================
@@ -465,10 +374,14 @@ def save_map(
 
 def main():
 
-    boundary = get_boundary()
+    logging.info(
+        "Cargando AOI..."
+    )
+
+    aoi = get_aoi()
 
     item = search_sentinel_image(
-        boundary
+        aoi
     )
 
     assets = item.assets
@@ -485,31 +398,41 @@ def main():
         assets["B11"].href
     )
 
-    swir2 = open_band(
-        assets["B12"].href
-    )
-
     scl = open_band(
         assets["SCL"].href
     )
 
-    red_arr = red.read(1).astype(
+    red_arr, profile = crop_to_aoi(
+        red,
+        aoi
+    )
+
+    nir_arr, _ = crop_to_aoi(
+        nir,
+        aoi
+    )
+
+    swir_arr, _ = crop_to_aoi(
+        swir,
+        aoi
+    )
+
+    scl_arr, _ = crop_to_aoi(
+        scl,
+        aoi
+    )
+
+    red_arr = red_arr.astype(
         np.float32
     )
 
-    nir_arr = nir.read(1).astype(
+    nir_arr = nir_arr.astype(
         np.float32
     )
 
-    swir_arr = swir.read(1).astype(
+    swir_arr = swir_arr.astype(
         np.float32
     )
-
-    swir2_arr = swir2.read(1).astype(
-        np.float32
-    )
-
-    scl_arr = scl.read(1)
 
     cloud_mask = build_cloud_mask(
         scl_arr
@@ -525,22 +448,13 @@ def main():
         swir_arr
     )
 
-    nbr = calculate_nbr(
-        nir_arr,
-        swir2_arr
-    )
-
     ndvi[cloud_mask] = np.nan
     ndmi[cloud_mask] = np.nan
-    nbr[cloud_mask] = np.nan
 
     fci = calculate_fci(
         ndvi,
-        ndmi,
-        nbr
+        ndmi
     )
-
-    profile = red.profile
 
     save_raster(
         OUTPUT_DIR / "ndvi.tif",
@@ -551,12 +465,6 @@ def main():
     save_raster(
         OUTPUT_DIR / "ndmi.tif",
         ndmi,
-        profile.copy()
-    )
-
-    save_raster(
-        OUTPUT_DIR / "nbr.tif",
-        nbr,
         profile.copy()
     )
 
@@ -585,13 +493,6 @@ def main():
         "NDMI",
         "RdBu",
         "mapa_ndmi.png"
-    )
-
-    save_map(
-        fci,
-        "Fuel Condition Index",
-        "RdYlGn_r",
-        "mapa_fci.png"
     )
 
     logging.info(

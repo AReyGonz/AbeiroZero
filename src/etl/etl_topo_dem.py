@@ -7,12 +7,8 @@
 ==============================================================================
 
 Qué hace este script, paso a paso:
-  1. Obtiene el polígono administrativo de Larouco. Primero lo intenta vía
-     Nominatim (más simple y fiable: ya devuelve el polígono "cosido").
-     Si falla, lo intenta vía Overpass reconstruyendo el polígono a partir
-     de los segmentos de la relación (linemerge + polygonize, respetando
-     roles "outer"/"inner"). Si ambos fallan, usa un bounding box de
-     respaldo (aproximado, indicado explícitamente).
+  1. 1. Obtiene el AOI oficial de Larouco
+   mediante src.aoi.boundary.get_aoi().
   2. Calcula qué teselas (tiles) de 1°x1° del Copernicus DEM GLO-30 cubren
      esa zona y las descarga del bucket público de AWS Open Data
      (s3://copernicus-dem-30m), sin credenciales.
@@ -64,29 +60,8 @@ from rasterio.io import MemoryFile
 from rasterio.mask import mask as rio_mask
 from rasterio.merge import merge as rio_merge
 from requests.adapters import HTTPAdapter
-from shapely.geometry import LineString, box
-from shapely.ops import linemerge, polygonize, unary_union
+from src.aoi.boundary import get_aoi
 from urllib3.util.retry import Retry
-
-# ------------------------------------------------------------------------------
-# CONFIGURACIÓN POR DEFECTO
-# ------------------------------------------------------------------------------
-
-NOMBRE_MUNICIPIO_DEFECTO = "Larouco, Ourense, Galicia, España"
-EPSG_DESTINO_DEFECTO = "EPSG:25829"  # ETRS89 / UTM 29N (estándar en Galicia)
-
-NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
-S3_BASE_URL = "https://copernicus-dem-30m.s3.amazonaws.com"
-
-# Nominatim exige identificarse con un User-Agent descriptivo (política de uso)
-HEADERS_HTTP = {"User-Agent": "larouco-dem-script/1.0 (uso educativo/personal)"}
-
-# Bounding box de respaldo (lon_min, lat_min, lon_max, lat_max), WGS84.
-# Es aproximado: cubre con margen el término municipal real
-# (centro ~42.346N, -7.164W; superficie ~23.7 km²). Solo se usa si fallan
-# tanto Nominatim como Overpass.
-BBOX_RESPALDO = (-7.24, 42.31, -7.09, 42.40)
 
 # Aviso de atribución que exige la licencia de Copernicus DEM (Airbus/DLR/ESA)
 # en caso de distribuir o comunicar el dato (modificado o no) a terceros,
@@ -107,6 +82,10 @@ AVISO_LICENCIA_COPERNICUS = (
 # ------------------------------------------------------------------------------
 # UTILIDADES
 # ------------------------------------------------------------------------------
+EPSG_DESTINO_DEFECTO = "EPSG:25829"
+
+# Bucket público AWS Open Data
+S3_BASE_URL = "https://copernicus-dem-30m.s3.amazonaws.com"
 
 def crear_sesion_http(reintentos=3):
     """
@@ -123,7 +102,10 @@ def crear_sesion_http(reintentos=3):
     adaptador = HTTPAdapter(max_retries=retry)
     sesion.mount("https://", adaptador)
     sesion.mount("http://", adaptador)
-    sesion.headers.update(HEADERS_HTTP)
+    sesion.headers.update(
+    {
+        "User-Agent":
+        "abeirozero-dem/1.0"})
     return sesion
 
 
@@ -146,124 +128,37 @@ def comprobar_herramientas_gdal():
 # PASO 1: LÍMITE ADMINISTRATIVO DEL MUNICIPIO
 # ------------------------------------------------------------------------------
 
-def obtener_limite_via_nominatim(sesion, nombre_municipio):
+def obtener_limite_municipio(
+    ruta_salida_gpkg
+):
     """
-    Pide a Nominatim el polígono del municipio directamente (polygon_geojson=1).
-    Nominatim ya devuelve el polígono "cosido" y listo, sin que tengamos que
-    reconstruirlo a partir de segmentos sueltos.
+    Obtiene el AOI oficial
+    desde src.aoi.boundary.
     """
-    params = {
-        "q": nombre_municipio,
-        "format": "jsonv2",
-        "polygon_geojson": 1,
-        "limit": 1,
-    }
-    r = sesion.get(NOMINATIM_URL, params=params, timeout=60)
-    r.raise_for_status()
-    resultados = r.json()
 
-    if not resultados:
-        raise RuntimeError("Nominatim no devolvió resultados.")
+    print(
+        "Usando AOI oficial "
+        "src.aoi.boundary.get_aoi()"
+    )
 
-    geojson = resultados[0].get("geojson")
-    if geojson is None or geojson.get("type") not in ("Polygon", "MultiPolygon"):
-        raise RuntimeError("Nominatim no devolvió un polígono utilizable.")
+    gdf = get_aoi()
 
-    from shapely.geometry import shape
-    geom = shape(geojson)
+    gdf.to_file(
+        ruta_salida_gpkg,
+        driver="GPKG"
+    )
 
-    return gpd.GeoDataFrame({"name": [nombre_municipio]}, geometry=[geom], crs="EPSG:4326")
+    print(
+        f"Límite guardado en: "
+        f"{ruta_salida_gpkg}"
+    )
 
-
-def obtener_limite_via_overpass(sesion):
-    """
-    Alternativa a Nominatim: pide la relación de límite administrativo a
-    Overpass y reconstruye el polígono correctamente.
-
-    IMPORTANTE: las relaciones de límites de OSM vienen partidas en
-    segmentos ("ways"), no como anillos cerrados por miembro. Hay que:
-      1. Separar los segmentos por rol ("outer" forma el contorno,
-         "inner" forma huecos/enclaves).
-      2. Unir los segmentos de cada grupo con linemerge (encajan por sus
-         extremos aunque vengan en distinto orden/orientación).
-      3. Cerrar los anillos resultantes con polygonize.
-      4. Restar los huecos ("inner") al contorno ("outer").
-    """
-    query = """
-    [out:json][timeout:90];
-    relation
-      ["boundary"="administrative"]
-      ["admin_level"="8"]
-      ["name"="Larouco"];
-    out geom;
-    """
-    r = sesion.get(OVERPASS_URL, params={"data": query}, timeout=120)
-    r.raise_for_status()
-    data = r.json()
-
-    if not data.get("elements"):
-        raise RuntimeError("Overpass no devolvió ninguna relación.")
-
-    relacion = data["elements"][0]
-
-    lineas_outer, lineas_inner = [], []
-    for miembro in relacion.get("members", []):
-        if "geometry" not in miembro or len(miembro["geometry"]) < 2:
-            continue
-        coords = [(p["lon"], p["lat"]) for p in miembro["geometry"]]
-        linea = LineString(coords)
-        if miembro.get("role") == "inner":
-            lineas_inner.append(linea)
-        else:
-            lineas_outer.append(linea)
-
-    if not lineas_outer:
-        raise RuntimeError("La relación no tiene segmentos 'outer'.")
-
-    contorno_unido = linemerge(lineas_outer)
-    poligonos_outer = list(polygonize(contorno_unido))
-    if not poligonos_outer:
-        raise RuntimeError("No se pudieron cerrar los anillos exteriores (geometría incompleta).")
-
-    geom = unary_union(poligonos_outer)
-
-    if lineas_inner:
-        huecos_unidos = linemerge(lineas_inner)
-        poligonos_inner = list(polygonize(huecos_unidos))
-        if poligonos_inner:
-            geom = geom.difference(unary_union(poligonos_inner))
-
-    return gpd.GeoDataFrame({"name": ["Larouco"]}, geometry=[geom], crs="EPSG:4326")
-
-
-def obtener_limite_municipio(nombre_municipio, ruta_salida_gpkg):
-    """
-    Orquesta la obtención del límite: Nominatim -> Overpass -> bbox de
-    respaldo, en ese orden. Guarda el resultado en GeoPackage para que
-    quede constancia de qué geometría se usó.
-    """
-    sesion = crear_sesion_http()
-
-    print(f"Buscando límite administrativo de '{nombre_municipio}' en Nominatim...")
-    try:
-        gdf = obtener_limite_via_nominatim(sesion, nombre_municipio)
-        print("OK: límite obtenido vía Nominatim.")
-    except Exception as e1:
-        print(f"  Nominatim falló ({e1}). Probando con Overpass...")
-        try:
-            gdf = obtener_limite_via_overpass(sesion)
-            print("OK: límite obtenido vía Overpass.")
-        except Exception as e2:
-            print(f"  Overpass también falló ({e2}).")
-            print(f"  AVISO: usando bounding box aproximado de respaldo: {BBOX_RESPALDO}")
-            print("  (Este bbox es una aproximación manual, no el límite administrativo exacto.)")
-            gdf = gpd.GeoDataFrame(geometry=[box(*BBOX_RESPALDO)], crs="EPSG:4326")
-
-    gdf.to_file(ruta_salida_gpkg, driver="GPKG")
-    print(f"Límite guardado en: {ruta_salida_gpkg}")
     return gdf
 
-
+if gdf.crs is None:
+    raise ValueError(
+        "El AOI devuelto por get_aoi() no tiene CRS definido."
+    )
 # ------------------------------------------------------------------------------
 # PASO 2-3: DESCARGA, MOSAICO Y RECORTE DEL DEM
 # ------------------------------------------------------------------------------
@@ -286,16 +181,32 @@ def listar_tiles_necesarios(gdf):
     floor() en ambos extremos (no ceil en el máximo, que añadiría una
     tesela de más si el límite cae justo en un grado entero).
     """
-    minx, miny, maxx, maxy = gdf.total_bounds
-    lat_min_t, lat_max_t = math.floor(miny), math.floor(maxy)
-    lon_min_t, lon_max_t = math.floor(minx), math.floor(maxx)
 
-    tiles = [
+    gdf4326 = gdf.to_crs(
+        "EPSG:4326"
+    )
+
+    minx, miny, maxx, maxy = (
+        gdf4326.total_bounds
+    )
+
+    lat_min_t = math.floor(miny)
+    lat_max_t = math.floor(maxy)
+
+    lon_min_t = math.floor(minx)
+    lon_max_t = math.floor(maxx)
+
+    return [
         nombre_tile(lat, lon)
-        for lat in range(lat_min_t, lat_max_t + 1)
-        for lon in range(lon_min_t, lon_max_t + 1)
+        for lat in range(
+            lat_min_t,
+            lat_max_t + 1
+        )
+        for lon in range(
+            lon_min_t,
+            lon_max_t + 1
+        )
     ]
-    return tiles
 
 
 def descargar_tiles(tiles, sesion):
@@ -356,8 +267,13 @@ def mosaicar_y_recortar(datasets, gdf, ruta_salida):
 
         with memfile_mosaico.open() as src:
             print("Recortando al polígono del municipio...")
-            geometrias = gdf.geometry.values
+            geometrias = [geom.__geo_interface__ for geom in gdf.geometry]
             imagen_recortada, transform_recortada = rio_mask(src, geometrias, crop=True)
+            imagen_recortada = np.where(
+                np.isnan(imagen_recortada),
+                nodata,
+                imagen_recortada
+            )
             nodata = src.nodata if src.nodata is not None else -32768.0
 
             meta_recorte = src.meta.copy()
@@ -477,7 +393,6 @@ def visualizar(ruta_dem, ruta_slope_deg, ruta_aspect, ruta_png):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--municipio", default=NOMBRE_MUNICIPIO_DEFECTO, help="Nombre a buscar en Nominatim.")
     parser.add_argument("--epsg", default=EPSG_DESTINO_DEFECTO, help="CRS de destino (por defecto EPSG:25829).")
     parser.add_argument("--salida", default="salidas_larouco", help="Carpeta de salida.")
     args = parser.parse_args()
@@ -506,7 +421,7 @@ def main():
     try:
         comprobar_herramientas_gdal()
 
-        gdf = obtener_limite_municipio(args.municipio, rutas["boundary"])
+        gdf = obtener_limite_municipio(rutas["boundary"])
         tiles = listar_tiles_necesarios(gdf)
         print("\nTeselas Copernicus DEM necesarias:")
         for t in tiles:
@@ -533,6 +448,10 @@ def main():
 
     finally:
         # Cerramos explícitamente los datasets y MemoryFile abiertos en memoria
+        try:
+            sesion.close()
+        except Exception:
+            pass
         for ds in datasets:
             try:
                 ds.close()
